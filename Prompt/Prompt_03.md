@@ -1,376 +1,312 @@
-# 02 — Kubernetes Investigation Engine
+# 03 — AI Reasoning Engine
 
 ## Context
 
-Project setup (Prompt 01) is complete: backend, frontend, Docker, and the
-black-and-white design system are in place.
-
-We now build the **Kubernetes Investigation Layer**.
+The Kubernetes Investigation Layer (Prompt 02) is complete and
+**context-aware** — it can gather structured evidence (pods, logs, events,
+deployments, networking) for any specific cluster found in the local
+kubeconfig.
 
 ```text
 Frontend
     ↓
-FastAPI Backend (Orchestrator)
+FastAPI Backend
     ↓
-Kubernetes Investigation Layer
-        ├── Cluster Registry (kubeconfig contexts)
-        ├── Check Pods
-        ├── Read Logs
-        ├── Analyze Events
-        ├── Inspect Deployments
-        └── Check Networking
+Kubernetes Investigation Layer  (scoped to one cluster/context)
     ↓
 AI Kubernetes Agent
+        ↓
+LLM Reasoning
+(OpenRouter via InsForge Key)
+        ↓
+Root Cause Analysis
+        ↓
+Suggested Fix
 ```
 
-This layer behaves like a **junior DevOps engineer collecting evidence**
-before AI reasoning starts. It only gathers facts — no interpretation, no
-root cause, no fixes.
+Goal: make the system intelligent. The AI agent should behave like a
+**Senior Kubernetes SRE** who:
 
-> ⚠️ Still **NOT** implementing AI reasoning. Evidence gathering only.
+1. Understands Kubernetes failure modes
+2. Correlates pod status + logs + events + deployment state — not just
+   summarizes them individually
+3. Identifies a root cause
+4. Suggests a concrete, actionable fix
+5. States a confidence score with reasoning
 
-### Multi-cluster requirement (new)
-
-A local kubeconfig can contain multiple clusters (contexts) — e.g.
-`docker-desktop`, `minikube`, `staging-cluster`. This system must support
-investigating **any** of them, not just whatever `kubectl` treats as the
-current context. Every kubectl call in this layer must be able to target an
-explicit context, and the backend must expose a way to list what's
-available. This is what the frontend dashboard (Prompt 04) will use to let
-the user click a cluster before investigating.
-
-Use **kubectl commands internally** (subprocess) — not the Kubernetes
-Python SDK. Keep it simple and inspectable.
+Use the **OpenRouter API key provided via InsForge**. Never hardcode
+secrets; read from environment variables only.
 
 ---
 
 ## Goal
 
-Build the Kubernetes Investigation Layer as modular, testable components:
+Build the **AI Kubernetes Agent** as a distinct layer that consumes the
+Prompt 02 investigation payload and produces a diagnosis:
 
 ```text
-Cluster Registry
-Kubectl Executor
-Pod Inspector
-Logs Collector
-Events Analyzer
-Deployment Inspector
-Network Inspector
-Investigation Service (orchestrator)
+Prompt Builder
+LLM Client
+Root Cause Analyzer
+Fix Recommendation Engine
+Confidence Engine
 ```
-
-FastAPI exposes this layer through two endpoints: list clusters, run an
-investigation against one of them.
 
 ---
 
 ## Requirements
 
-### 1. Cluster Registry
+### 1. Prompt Builder
 
-Responsible for discovering and validating kubeconfig contexts.
+Builds a single, structured troubleshooting prompt from the investigation
+payload — not a dump of raw JSON.
 
-- Read contexts via `kubectl config get-contexts -o name` (names) and
-  `kubectl config view -o json` (to identify the current context and
-  cluster server info).
-- Expose:
-  - `list_contexts() -> list[ClusterInfo]`
-  - `context_exists(name: str) -> bool`
-- `ClusterInfo` (Pydantic model):
+System prompt persona: **Senior Kubernetes SRE**, precise and evidence-based,
+who never guesses without stating the evidence behind a claim.
 
-```json
-{
-  "name": "docker-desktop",
-  "is_current": true
-}
+The user-turn content must include, clearly labeled:
+
+```text
+Cluster/context under investigation
+Pod status (name, namespace, failure type, restart count)
+Relevant log excerpts (already trimmed by Prompt 02)
+Summarized events
+Deployment health
+Networking findings
+Any collection errors reported by the investigation layer
 ```
 
-- If `KUBECONFIG_PATH` is set (from Prompt 01's env var), read from that
-  path explicitly rather than relying on the shell's default.
-- If no contexts are found, return an empty list — do not raise. The API
-  layer decides how to surface that to the user.
+Instruct the model to return exactly these sections, in this order, and
+nothing else:
+
+```text
+1. Root Cause
+2. Explanation
+3. Suggested Fix
+4. kubectl Commands
+5. Prevention Recommendation
+6. Confidence Score (0-100) with a one-line justification
+```
+
+Ask explicitly for **structured, deterministic** output (e.g. request JSON
+matching a schema — see Root Cause Analyzer below) rather than free-form
+prose, so the backend can parse it reliably instead of regex-scraping a
+paragraph.
+
+If the investigation payload reports `errors` (a component failed to
+collect data), instruct the model to factor that into its confidence score
+and say so explicitly rather than ignoring the gap.
 
 ---
 
-### 2. Kubectl Executor
+### 2. LLM Client
 
-A single, reusable utility that every other component calls through — no
-component should shell out to `kubectl` directly.
+Calls **OpenRouter** using the key sourced from InsForge.
+
+Config (from `.env`, already scaffolded in Prompt 01):
+
+```env
+OPENROUTER_API_KEY=
+OPENROUTER_MODEL=
+```
 
 Requirements:
 
-- Built on `subprocess.run`, never `shell=True`.
-- Accepts an optional `context: str | None`. When provided, every command
-  is run with `--context <name>` appended.
-- Captures stdout, stderr, and exit code separately.
-- Enforces a timeout on every call (default from config, e.g. 15s) so a
-  hung cluster can't hang the whole investigation.
-- Returns a structured result, never a raw string blob:
+- Use `HTTPX` (async client).
+- Explicit timeout (e.g. 30s) — LLM calls are slower than kubectl calls.
+- Retry transient failures (e.g. 429, 5xx) with capped exponential backoff
+  (e.g. up to 3 attempts) — do not retry on 4xx client errors like bad
+  auth.
+- On final failure, raise a typed exception the API layer can translate
+  into a clean error response — never let a raw HTTPX exception or stack
+  trace reach the client.
+- Log request duration, model used, and token usage (if the response
+  includes it) — never log the API key or full prompt/response bodies at
+  INFO level; use DEBUG for verbose payloads only, and ensure the key
+  itself is never logged at any level.
+
+---
+
+### 3. Root Cause Analyzer
+
+Parses the LLM's structured response into a typed model — this is the
+contract between the AI layer and the API layer:
 
 ```python
-class KubectlResult(BaseModel):
-    success: bool
-    command: str
-    stdout: str
-    stderr: str
-    exit_code: int
+class Diagnosis(BaseModel):
+    context: str
+    root_cause: str
+    explanation: str
+    suggested_fix: str
+    kubectl_commands: list[str]
+    prevention: str
+    confidence: int  # 0-100
+    confidence_reasoning: str
 ```
 
-- Logs every invocation (command + context + duration) at INFO, failures
-  at WARNING, with stderr included.
-- Never raises on a failed kubectl call — callers inspect `success` and
-  decide how to degrade.
-
-Example supported commands (all context-aware):
-
-```bash
-kubectl --context <ctx> get pods -A -o json
-kubectl --context <ctx> get events -A -o json
-kubectl --context <ctx> logs <pod-name> -n <namespace> --tail=200
-kubectl --context <ctx> describe deployment <deployment-name> -n <namespace>
-kubectl --context <ctx> get svc -A -o json
-```
-
-Prefer `-o json` over parsing human-readable `kubectl` output wherever
-possible — it's far more reliable than screen-scraping text.
-
----
-
-### 3. Pod Inspector
-
-Detects unhealthy pods and classifies the failure type:
-
-```text
-CrashLoopBackOff
-ImagePullBackOff / ErrImagePull
-Pending (unscheduled)
-Error
-OOMKilled
-ContainerCreating (stuck beyond a threshold)
-```
-
-Structured output:
+Example correlation the model should be capable of:
 
 ```json
+// investigation evidence (input)
 {
-  "healthy": false,
-  "checked_namespaces": ["default", "kube-system"],
-  "problematic_pods": [
-    {
-      "name": "payment-service-7d8f9",
-      "namespace": "default",
-      "status": "CrashLoopBackOff",
-      "restart_count": 7,
-      "container": "payment-service"
-    }
-  ]
+  "pods": { "status": "CrashLoopBackOff" },
+  "logs": { "error": "DATABASE_URL missing" }
 }
 ```
 
----
-
-### 4. Logs Collector
-
-Fetches recent logs **only for pods the Pod Inspector flagged** — don't
-pull logs for every pod in the cluster.
-
-Focus extraction on:
-
 ```text
-Exceptions / stack traces
-Connection failures
-Missing environment variables / config
-Image or startup failures
+// expected reasoning (output)
+Root Cause: Application failed to start because the DATABASE_URL
+environment variable is missing from the deployment spec.
 ```
 
-Constraints:
+The point of this component is **correlation, not transcription** — it
+should never just echo the log line back as the root cause without
+connecting it to the pod state and restart pattern.
 
-- Tail logs (e.g. last 200 lines), never fetch full history.
-- If a pod has restarted, prefer the **previous** container's logs
-  (`kubectl logs --previous`) since that's usually where the failure is.
-- Truncate any single log excerpt to a few KB max before returning it —
-  this payload will later be sent to an LLM, so keep it lean.
+If the LLM response doesn't parse into the `Diagnosis` schema, treat it as
+a failure (log it, return a clean error) rather than silently passing
+through malformed data.
 
 ---
 
-### 5. Events Analyzer
+### 4. Fix Recommendation Engine
 
-Reads and summarizes cluster events, filtered to warning-level reasons:
+Ensures `suggested_fix` and `kubectl_commands` are:
+
+- **Practical** — a real command the user could actually run, not
+  pseudocode
+- **Beginner-friendly** — plain language explanation alongside the command
+- **Kubernetes-specific** — tied to the actual resource names found during
+  investigation (e.g. the real deployment name), not a generic template
+
+Example:
 
 ```text
-FailedScheduling
-BackOff
-FailedMount
-FailedPull / ErrImagePull
-Unhealthy
-```
+Suggested Fix:
+Add the missing DATABASE_URL environment variable to the deployment spec.
 
-Group repeated events (same reason + object) into a single summarized
-entry with a count, rather than returning every duplicate.
+kubectl Commands:
+kubectl edit deployment payment-service -n default
+```
 
 ---
 
-### 6. Deployment Inspector
+### 5. Confidence Engine
 
-Checks deployment health:
+Confidence is not decoration — it should reflect actual evidence strength.
+Encourage (via the prompt) reasoning like:
 
 ```text
-Desired vs. available vs. unavailable replicas
-Rollout status / stuck rollouts
-Deployment conditions (Available, Progressing)
+Confidence: 92%
+Reasoning:
+- Pod state = CrashLoopBackOff (strong signal)
+- Logs explicitly show missing env var (direct evidence)
+- Restart count confirms repeated startup failure (corroborating)
 ```
 
-Flags a deployment as unhealthy if available replicas < desired for
-longer than a configurable grace period, or if a condition reports
-`False`.
+Lower confidence should correlate with thinner evidence — e.g. if the
+investigation payload had `errors` (a component didn't collect data), the
+model should reflect that uncertainty in a lower score, not report 90%+ on
+partial evidence.
 
 ---
 
-### 7. Network Inspector
+## FastAPI Integration
 
-Checks service/networking health:
-
-```text
-Service exists for the workload
-Selector matches at least one pod's labels
-Endpoints object is non-empty
-```
-
-DNS-level checks (e.g. resolving a service name from inside the cluster)
-are out of scope for this prompt — flag selector/endpoint mismatches only.
-
----
-
-### 8. Investigation Service (Orchestrator)
-
-Runs the full pipeline for a **specific context**, in order:
+Update `POST /investigate` (from Prompt 02) so the full flow now runs:
 
 ```text
-Resolve & validate context
+Collect Kubernetes Evidence (scoped to `context`)
     ↓
-Check Pods
+Send to AI Agent
     ↓
-Collect Logs (for flagged pods only)
+LLM Reasoning
     ↓
-Analyze Events
+Root Cause Analysis
     ↓
-Inspect Deployments
+Suggested Fix
     ↓
-Check Networking
+Return Diagnosis
 ```
 
-- Each step's failure should not abort the whole investigation — if
-  `kubectl get events` fails, still return what pod/log data was
-  collected, with an explicit `errors` list noting what step failed.
-- Returns one structured payload:
+Request is unchanged from Prompt 02:
 
 ```json
-{
-  "context": "docker-desktop",
-  "pods": {},
-  "logs": {},
-  "events": {},
-  "deployments": {},
-  "network": {},
-  "errors": []
-}
+{ "context": "docker-desktop" }
 ```
 
----
-
-## FastAPI API
-
-### `GET /clusters`
-
-Lists kubeconfig contexts available to investigate.
-
-```json
-{
-  "clusters": [
-    { "name": "docker-desktop", "is_current": true },
-    { "name": "minikube", "is_current": false }
-  ]
-}
-```
-
-### `POST /investigate`
-
-Request body:
-
-```json
-{ "context": "minikube" }
-```
-
-- `context` is optional. If omitted, use the current kubeconfig context.
-- If `context` is provided but not found via the Cluster Registry, return
-  `422` with a clear error message rather than silently falling back.
-
-Response:
+Response now includes the diagnosis:
 
 ```json
 {
   "status": "success",
+  "context": "docker-desktop",
   "investigation": {
-    "context": "minikube",
     "pods": {},
     "logs": {},
     "events": {},
     "deployments": {},
-    "network": {},
-    "errors": []
+    "network": {}
+  },
+  "diagnosis": {
+    "root_cause": "DATABASE_URL missing",
+    "explanation": "Application cannot connect to the database on startup.",
+    "suggested_fix": "Add the missing DATABASE_URL environment variable.",
+    "kubectl_commands": ["kubectl edit deployment payment-service -n default"],
+    "prevention": "Validate required env vars in CI before deploying.",
+    "confidence": 92,
+    "confidence_reasoning": "Pod state, logs, and restart count all agree."
   }
 }
 ```
 
-No AI yet. No root cause analysis yet. This step is evidence gathering
-only, scoped to one explicit cluster per call.
+Keep both `investigation` (raw evidence) and `diagnosis` (AI output) in the
+response — the frontend will want to show both.
 
 ---
 
 ## Constraints
 
-Do **NOT** implement:
-- OpenRouter / any LLM reasoning
-- Root cause analysis or fix recommendation
-- InsForge integration
+Do **NOT** implement in this prompt:
 - Authentication
+- Investigation history / persistence
 - Realtime updates
+- Frontend changes
+- Deployment/infra changes
 
-Do **NOT** use the Kubernetes Python SDK — kubectl subprocess calls only.
+Only build the AI reasoning layer on top of the existing investigation
+layer. Keep it explainable — no hidden multi-agent chains, one clear
+prompt → one clear structured response.
 
-Do **NOT** break the project-setup foundation from Prompt 01 (health
-endpoint, CORS, logging, config, black-and-white frontend shell all keep
-working).
-
-Keep every component small, typed, and independently testable.
+Do **NOT** break Prompt 01 or Prompt 02 functionality — `GET /clusters`
+and the evidence-only shape of `POST /investigate` must continue to work;
+this prompt extends the response, it doesn't replace the contract.
 
 ---
 
 ## Expected Result
 
 ```http
-GET /clusters
-```
-returns every cluster found in the local kubeconfig, correctly flagging
-the current one.
-
-```http
 POST /investigate
 { "context": "docker-desktop" }
 ```
-returns structured, real Kubernetes troubleshooting evidence for that
-specific cluster — pods, logs, events, deployments, and networking findings
-— with zero AI interpretation applied.
+
+now returns real Kubernetes evidence **and** an AI-generated diagnosis in
+one response — root cause, explanation, fix, exact kubectl commands,
+prevention advice, and a confidence score grounded in the evidence
+collected.
+
+The backend now behaves like a **Senior Kubernetes SRE** helping
+troubleshoot a specific cluster on request.
 
 ## Definition of Done (checklist)
 
-- [ ] `GET /clusters` lists all kubeconfig contexts with `is_current` set correctly
-- [ ] `POST /investigate` accepts an optional `context` and targets it end-to-end
-- [ ] Invalid/unknown context returns `422`, not a silent fallback
-- [ ] Kubectl Executor never uses `shell=True`, always has a timeout, and returns structured `KubectlResult`
-- [ ] Logs are pulled only for flagged pods, tailed and size-limited
-- [ ] Events are deduplicated/summarized, not raw event dumps
-- [ ] A single component failure (e.g. events call fails) doesn't abort the whole investigation — it's captured in `errors`
-- [ ] No Kubernetes SDK usage anywhere — kubectl subprocess only
-- [ ] No AI, auth, or realtime logic present yet
-- [ ] Prompt 01's `/health` endpoint and frontend still work unmodified
+- [ ] `POST /investigate` returns both `investigation` and `diagnosis` for the requested context
+- [ ] LLM output is parsed into a typed `Diagnosis` model, not regex-scraped text
+- [ ] Malformed/unparseable LLM responses fail cleanly instead of returning garbage
+- [ ] OpenRouter key is read from env only, never logged, never hardcoded
+- [ ] HTTPX client has a timeout and capped retries on transient failures only
+- [ ] Confidence score visibly correlates with evidence strength (spot-check a few scenarios)
+- [ ] `kubectl_commands` reference real resource names from the investigation, not placeholders
+- [ ] Prompt 01 and Prompt 02 functionality still works unchanged
