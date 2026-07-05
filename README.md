@@ -225,6 +225,7 @@ prompt is a self-contained spec with its own Definition of Done:
 3. [AI Reasoning Engine](prompts/03-prompt-ai-reasoning-engine.md) — root cause, fix, confidence scoring
 4. [Dashboard & API Integration](prompts/04-prompt-dashboard-and-api.md) — cluster selector, realtime progress, history
 5. [Integration, Testing & Deployment](prompts/05-prompt-integration-testing-deployment.md) — reliability hardening, real-failure testing
+6. [Cross-Cluster Correlation & Log Continuity](prompts/06-prompt-cross-cluster-and-log-continuity.md) — multi-cluster root cause correlation, log archiving for rotated/missing logs
 
 ---
 
